@@ -37,7 +37,7 @@ object EmbeddedSpraryBuild extends Build {
     Project(embeddedSprayName, file("embedded-spray"))
       .settings(standardProjectSettings: _*)
       .settings(
-        UpdateVersionInFiles(file("README.md")))
+        UpdateVersionInFiles(file("README.md"), file("examples/resource-server/build.sbt")))
       .settings(
         libraryDependencies ++= Seq(
           "com.typesafe.akka" %% "akka-actor" % "2.2.3",

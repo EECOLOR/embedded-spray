@@ -13,7 +13,7 @@ class Server(
   name: String,
   val host: Host, val port: Port,
   serviceFactory: ServiceFactory,
-  idleTimeout: Option[FiniteDuration])(implicit system:ActorSystem) {
+  idleTimeout: Option[FiniteDuration] = None)(implicit system:ActorSystem) {
 
   def this(name: String, host: Host, port: Port,
     serviceFactory: ServiceFactory, idleTimeout: FiniteDuration)(implicit system:ActorSystem) =
