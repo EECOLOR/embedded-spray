@@ -34,27 +34,42 @@ implicit val system = ActorSystem("my-actor-system")
 
 val server = new Server(
   name = "my-server", // used to name underlying actors
+  idleTimeout = 2.seconds // automatically unbind if there is no activity
+)
+
+val listener = server.bind(
   host = "localhost",
   port = Port.free, // this finds a free port, it's just an Int
   serviceFactory = Props(MyService))
 
-// start returns a Future[Server.Stopped]
-val stopped = server.start()
+listener.bound.onComplete { _ =>
+  // the service is bound to the host and port
 
-// shutdown the actor system when the server stops
-stopped.onComplete { _ =>
+  // if you want you can unbind the service
+  listener.unbind()
+}
+
+listener.unbound.onComplete { _ =>
+  // there service has been unbound
+}
+
+// timeout is for the individual processes that need to be stopped
+val closed = server.close(2.seconds)
+
+// you can now safely shutdown the actor system
+closed.onComplete { _ =>
   system.shutdown()
 }
 
 ```
 
-Stopping the server
+Unbinding a service
 -------------------
 
 This can be done in three ways:
 
-1. Call `server.stop()`
-2. Dispatch a `Server.Stop` message from the service (`context.parent ! Server.Stop`)
+1. Call `listener.unbind()`
+2. Dispatch a `Listener.Unbind` message from the service (`context.parent ! Listener.Unbind`)
 3. Automatically when there is no more activity: `new Server(..., idleTimeout = 1.second)`
 
 Examples

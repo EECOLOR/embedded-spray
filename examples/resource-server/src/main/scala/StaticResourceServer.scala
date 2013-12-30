@@ -1,14 +1,18 @@
 
-import org.qirx.spray.embedded.Server
+import scala.concurrent.duration._
+import scala.io.Source
+
+import org.qirx.spray.embedded.Listener
 import org.qirx.spray.embedded.Port
-import spray.routing.HttpServiceActor
+import org.qirx.spray.embedded.Server
+
 import akka.actor.ActorSystem
 import akka.actor.Props
-import spray.http.Uri
-import spray.http.StatusCodes
-import spray.routing.directives.ContentTypeResolver
 import akka.event.Logging
-import scala.io.Source
+import spray.http.StatusCodes
+import spray.http.Uri
+import spray.routing.HttpServiceActor
+import spray.routing.directives.ContentTypeResolver
 
 object StaticResourceServer extends App {
 
@@ -17,20 +21,22 @@ object StaticResourceServer extends App {
   val port = Port.free
   val host = "localhost"
 
-  val server = new Server("my-server", host, port, Props(ResourceService))
+  val server = new Server("my-server")
 
   println("Starting server at http://" + host + ":" + port)
 
-  val stopped = server.start()
+  val listener = server.bind(host, port, Props(ResourceService))
 
   import system.dispatcher
 
-  stopped.onComplete { _ =>
+  for {
+    _ <- listener.unbound
+    _ <- server.close(2.seconds)
+  } {
     println("Server stopped")
     system.shutdown()
     system.awaitTermination()
   }
-
 }
 
 object ResourceService extends HttpServiceActor {
@@ -45,7 +51,7 @@ object ResourceService extends HttpServiceActor {
     } ~
       path("stop") {
         complete {
-          context.parent ! Server.Stop
+          context.parent ! Listener.Unbind
           StatusCodes.NoContent
         }
       } ~

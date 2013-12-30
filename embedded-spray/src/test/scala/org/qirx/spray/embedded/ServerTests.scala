@@ -1,33 +1,26 @@
 package org.qirx.spray.embedded
 
-import org.specs2.mutable.Specification
-import akka.actor.Props
-import akka.actor.Actor
-import scala.concurrent.Await
-import scala.concurrent.duration._
-import scala.concurrent.Future
-import org.specs2.time.NoTimeConversions
-import spray.http._
-import spray.client.pipelining._
-import akka.actor.ActorSystem
-import scala.concurrent.Awaitable
-import spray.routing.HttpServiceActor
 import java.net.BindException
 import java.net.ServerSocket
-import akka.actor.DeadLetter
-import akka.event.Logging
-import akka.actor.DeadLetter
-import akka.actor.PoisonPill
-import akka.io.IO
-import spray.can.Http
-import com.typesafe.config.ConfigFactory
-import org.specs2.matcher.Matcher
-import spray.routing.StandardRoute
-import spray.routing.Directives
-import akka.actor.ActorRef
-import akka.actor.ActorContext
 import java.util.concurrent.TimeoutException
+import scala.concurrent.Await
+import scala.concurrent.Awaitable
+import scala.concurrent.Future
+import scala.concurrent.duration._
 import scala.util.Random
+import org.specs2.matcher.Matcher
+import org.specs2.mutable.Specification
+import org.specs2.time.NoTimeConversions
+import com.typesafe.config.ConfigFactory
+import akka.actor.Actor
+import akka.actor.ActorContext
+import akka.actor.ActorSystem
+import akka.actor.Props
+import spray.client.pipelining._
+import spray.http._
+import spray.routing.HttpServiceActor
+import spray.routing.StandardRoute
+import scala.concurrent.Promise
 
 class ServerTests extends Specification with NoTimeConversions {
 
@@ -36,30 +29,29 @@ class ServerTests extends Specification with NoTimeConversions {
     "open and close sockets correctly" in openAndCloseSockets
     "be able to start on different ports" in multiplePorts
     "automatically stop after the given idle timeout" in stopWhenIdle
+    "bind in a loop" in runInLoop
   }
 
   def handleRequests =
     withClient { client =>
-      withStartedServer { server =>
+      withBoundListener { port =>
 
-        val result = await(client(Get(url(server.port))))
+        val result = await(client(Get(url(port))))
         result.entity.asString === indexResponse
       }
     }
 
   def openAndCloseSockets =
     withServer { server =>
-      //give the actor system some time to start up
-
-      val port = server.port
+      val port = Port.free
 
       checkSocket(port, not(throwA[BindException]))
-      val stopped = server.start()
+      val listener = bind(server, port)
       // make a call, this makes sure the server is started
       sendRequestAndWait(port)
       checkSocket(port, throwA[BindException])
-      server.stop()
-      await(stopped)
+      listener.unbind()
+      await(listener.unbound)
 
       checkSocket(port, not(throwA[BindException]))
     }
@@ -75,23 +67,20 @@ class ServerTests extends Specification with NoTimeConversions {
   }
 
   def multiplePorts = {
-    withServer { server1 =>
+    withServer { server =>
 
-      withServer { server2 =>
+      val (listener1, port1) = bind(server)
+      val (listener2, port2) = bind(server)
 
-        val stopped1 = server1.start()
-        val stopped2 = server2.start()
+      sendRequestAndWait(port1)
+      sendRequestAndWait(port2)
 
-        sendRequestAndWait(server1.port)
-        sendRequestAndWait(server2.port)
+      listener1.unbind()
+      await(listener1.unbound)
 
-        server1.stop()
-        await(stopped1)
+      sendRequestAndWait(port2)
 
-        sendRequestAndWait(server2.port)
-
-        ok
-      }
+      ok
     }
   }
 
@@ -100,34 +89,61 @@ class ServerTests extends Specification with NoTimeConversions {
   private def stopWhenIdleAfterRequest =
     withServer(idleTimeout = 1.seconds) { server =>
 
-      val stopped = server.start()
+      val (listener, port) = bind(server)
 
       Thread.sleep(300)
-      sendRequestAndWait(server.port)
+      sendRequestAndWait(port)
       Thread.sleep(300)
-      sendRequestAndWait(server.port)
+      sendRequestAndWait(port)
       Thread.sleep(300)
-      sendRequestAndWait(server.port)
+      sendRequestAndWait(port)
       Thread.sleep(300)
-      sendRequestAndWait(server.port)
+      sendRequestAndWait(port)
 
       //being idle
 
-      await(stopped) must not(throwA[TimeoutException])
+      await(listener.unbound) must not(throwA[TimeoutException])
 
     }
 
   private def stopWhenIdleAfterStart =
     withServer(idleTimeout = 1.seconds) { server =>
 
-      val stopped = server.start()
+      val listener = bind(server, Port.free)
 
       //being idle
 
-      await(stopped) must not(throwA[TimeoutException])
+      await(listener.unbound) must not(throwA[TimeoutException])
     }
 
+  def runInLoop = {
+    withActorSystem(name = "runInLoop") { implicit system =>
+
+      val server = createServer(system.name, Some(500.milliseconds))
+      var results = 0
+      for (_ <- 1 to 5) {
+        val (listener, port) = bind(server)
+        sendRequestAndWait(port)
+        sendRequestAndWait(port)
+        await(listener.unbound)
+        results += 1
+      }
+
+      await(server.close(testTimeout))
+
+      results === 5
+    }
+  }
+
   private lazy val indexResponse = "This is the index page"
+
+  private def bind(server:Server, port:Port):Listener =
+    server.bind("localhost", port, FakeService())
+
+  private def bind(server:Server):(Listener, Port) = {
+    val port = Port.free
+    (bind(server, port), port)
+  }
 
   private def sendRequestAndWait(port: Port) =
     withClient { client =>
@@ -140,9 +156,6 @@ class ServerTests extends Specification with NoTimeConversions {
   private def createServer(name: String, idleTimeout: Option[FiniteDuration])(implicit system: ActorSystem) =
     new Server(
       name = name,
-      host = "localhost",
-      port = Port.free,
-      serviceFactory = FakeService(),
       idleTimeout = idleTimeout)
 
   private def url(port: Port) =
@@ -164,7 +177,9 @@ class ServerTests extends Specification with NoTimeConversions {
     def apply() = Props(new FakeService())
   }
 
-  private def await[T](f: Future[T]): T = Await.result(f, 2.seconds)
+  private val testTimeout = 2.seconds
+
+  private def await[T](f: Future[T]): T = Await.result(f, testTimeout)
 
   private def withActorSystem[T](name: String)(code: ActorSystem => T) = {
 
@@ -172,7 +187,6 @@ class ServerTests extends Specification with NoTimeConversions {
       """|akka.log-dead-letters-during-shutdown=off
          |akka.loglevel=WARNING
          |""".stripMargin
-
 
     val config = ConfigFactory.parseString(configString).withFallback(ConfigFactory.load())
 
@@ -195,18 +209,18 @@ class ServerTests extends Specification with NoTimeConversions {
   private def withServer[T](idleTimeout: Option[FiniteDuration])(code: Server => T): T =
     withActorSystem(name = "test") { implicit system =>
       val server = createServer(system.name, idleTimeout)
-      code(server)
-    }
-
-  private def withStartedServer[T](code: Server => T) =
-    withServer { server =>
-      val stopped = server.start()
       try {
         code(server)
       } finally {
-        server.stop();
-        await(stopped)
+        await(server.close(testTimeout))
       }
+    }
+
+  private def withBoundListener[T](code: Port => T) =
+    withServer { server =>
+      val (listener, port) = bind(server)
+      await(listener.bound)
+      code(port)
     }
 
   private def withClient[T](code: (HttpRequest => Future[HttpResponse]) => T) =

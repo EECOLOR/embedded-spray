@@ -1,47 +1,50 @@
 package org.qirx.spray.embedded
 
 import scala.concurrent.Future
+import scala.concurrent.duration._
+
 import akka.actor.ActorSystem
 import akka.actor.Props
-import scala.concurrent.Promise
-import scala.util.Random
-import com.typesafe.config.ConfigFactory
-import scala.concurrent.duration.FiniteDuration
+import akka.io.IO
+import akka.pattern.AskSupport
 import akka.util.Timeout
+import spray.can.Http
 
-class Server(
-  name: String,
-  val host: Host, val port: Port,
-  serviceFactory: ServiceFactory,
-  idleTimeout: Option[FiniteDuration] = None)(implicit system:ActorSystem) {
+class Server(name: String, idleTimeout: Option[FiniteDuration] = None)(implicit system: ActorSystem) extends AskSupport {
 
-  def this(name: String, host: Host, port: Port,
-    serviceFactory: ServiceFactory, idleTimeout: FiniteDuration)(implicit system:ActorSystem) =
-    this(name, host, port, serviceFactory, Some(idleTimeout))
+  def this(name: String, serviceFactory: ServiceFactory,
+    idleTimeout: FiniteDuration)(implicit system: ActorSystem) =
+    this(name, Some(idleTimeout))
 
-  val serverName = s"$name-$host-$port"
+  val server =
+    system.actorOf(Props(new ServerActor(name, idleTimeout.map(Timeout.apply))))
 
-  private def serverActor =
-    new ServerActor(serverName, serviceFactory, idleTimeout.map(Timeout.apply))
+  def bind(host: Host, port: Port, serviceFactory: ServiceFactory): Listener = {
+    implicit val timeout = Timeout(1.second)
+    import system.dispatcher
 
-  val server = system.actorOf(Props(serverActor), serverName + "-server")
-
-  def start(): Future[Server.Stopped] = {
-    val stopped = Promise[Server.Stopped]
-
-    server ! Server.Start(host, port, stopped.success)
-
-    stopped.future
+    val listener = (server ? Server.Bind(host, port, serviceFactory)).mapTo[Listener]
+    Listener.fromFuture(listener)
   }
 
-  def stop(): Unit = if (!system.isTerminated) server ! Server.Stop
+  def close(implicit timeout: Timeout): Future[Server.Closed] = {
+    import system.dispatcher
 
+    // we still have a problem here, the unbound
+
+    def unbindAll = server ? Server.UnbindAll
+    def closeAll = IO(Http) ? Http.CloseAll
+
+    unbindAll.flatMap(_ => closeAll).map(_ => ())
+  }
 }
 
 object Server {
 
-  type Stopped = Unit
-  case class Start(host: Host, port: Port, onStopped: Unit => Unit)
-  case object Stop
-  case object IdleTimeout
+  type Closed = Unit
+
+  case class Bind(host: Host, port: Port, serviceFactory:ServiceFactory)
+
+  case object UnbindAll
+  case object UnboundAll
 }

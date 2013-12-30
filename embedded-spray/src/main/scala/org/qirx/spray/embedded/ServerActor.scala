@@ -1,101 +1,111 @@
 package org.qirx.spray.embedded
 
+import scala.concurrent.Promise
+import scala.util.Failure
+import scala.util.Success
+
 import akka.actor.Actor
-import akka.io.IO
-import spray.can.Http
 import akka.actor.ActorRef
-import akka.io.Tcp
-import scala.concurrent.Future
-import akka.actor.Cancellable
+import akka.actor.Props
+import akka.actor.Terminated
 import akka.util.Timeout
-import spray.http.HttpRequest
 
-class ServerActor(name: String, serviceFactory: ServiceFactory, idleTimeout: Option[Timeout]) extends Actor {
+class ServerActor(val name: String, idleTimeout: Option[Timeout]) extends Actor with UnknownMessages {
 
-  import context.system
-  import context.dispatcher
+  private def newListenerActor(name: String, serviceFactory:ServiceFactory) =
+    new ListenerActor(name, serviceFactory, idleTimeout)
 
-  val service = context.actorOf(serviceFactory, name + "-service")
+  var listeners = Map.empty[ActorRef, ServerActor.ListenerBridge]
 
-  var onStoppedCallback: Option[Unit => Unit] = None
+  def receive: Receive = available orElse unknown("available")
 
-  var scheduledTimeout: Option[Cancellable] = None
+  val available: Receive = {
+    case Server.Bind(host, port, serviceFactory) =>
+      val listener = createAndBindListener(host, port, serviceFactory)
+      sender ! listener
 
-  lazy val receive = idle
+    case Listener.Bound =>
+      completeBindOf(sender)
 
-  lazy val idle = stopped orElse unknown("idle")
+    case Listener.Unbound =>
+      completeUnbindOf(sender)
 
-  val stopped: Receive = {
+    case Terminated(listenerActor) =>
+      completeRemovalOf(listenerActor)
 
-    case Server.Start(host, port, callback) =>
-      onStoppedCallback = Some(callback)
-      IO(Http) ! Http.Bind(self, host, port)
-      become("starting", starting)
+    case Server.UnbindAll =>
+      val commander = sender
+      if (listeners.isEmpty) commander ! Server.UnboundAll
+      else {
+        listeners.values.foreach(_.unbind)
+        become("unbindingAll", unbindingAll(commander))
+      }
   }
 
-  val starting: Receive = {
+  def unbindingAll(commander: ActorRef): Receive = {
+    case Listener.Unbound =>
+      completeUnbindOf(sender)
+      if (listeners.isEmpty) commander ! Server.UnboundAll
 
-    case Http.Bound(address) =>
-      scheduleTimeout()
-      become("started", started(listener = sender))
-
-    case stop @ Server.Stop =>
-      self ! stop // queue the message until we are started
+    case Terminated(listenerActor) =>
+      completeRemovalOf(listenerActor)
+      if (listeners.isEmpty) commander ! Server.UnboundAll
   }
 
-  def started(listener: ActorRef): Receive = {
+  private def createAndBindListener(host: Host, port: Port, serviceFactory:ServiceFactory) = {
+    val listenerName = s"$name-$host-$port"
+    val listenerActor = context.actorOf(Props(newListenerActor(listenerName, serviceFactory)), listenerName + "-listener")
 
-    case _: Tcp.Connected =>
-      sender ! Tcp.Register(self)
+    val listener = new ServerActor.ListenerBridge(listenerActor)
+    listeners += listenerActor -> listener
+    context.watch(listenerActor)
 
-    case Server.Stop =>
-      listener ! Http.Unbind
-      become("stopping", stopping)
+    listenerActor ! Listener.Bind(host, port)
 
-    case Server.IdleTimeout =>
-      self ! Server.Stop
-
-    case message =>
-      scheduleTimeout()
-      service forward message
+    listener
   }
 
-  val stopping: Receive = {
-
-    case Http.Unbound =>
-      IO(Http) ! Http.CloseAll
-
-    case Http.ClosedAll =>
-      become("stopped", stopped)
-      callOnStopped()
-
-    case message:Tcp.ConnectionClosed =>
-      service forward message
+  private def completeBindOf(listenerActor: ActorRef) = {
+    val listenerActor = sender
+    val listener = listeners.get(listenerActor)
+    listener.foreach(_.completeBind())
   }
 
-  def unknown(state: String): Receive = {
-    case unknown =>
-      println("=================================")
-      println(s"ServerActor got unknown message when $state: " + unknown)
-      println("=================================")
+  private def completeUnbindOf(listenerActor: ActorRef) = {
+    val listener = listeners.get(listenerActor)
+    listener.foreach(_.completeUnbind())
+    listeners -= listenerActor
+    context.unwatch(listenerActor)
+    context.stop(listenerActor)
   }
 
-  def become(state: String, receive: Receive) = context.become(receive orElse unknown(state))
-
-  def scheduleTimeout() = {
-    scheduledTimeout.foreach(_.cancel())
-    scheduledTimeout = None
-    idleTimeout.foreach { idleTimeout =>
-      val timeout = idleTimeout.duration
-      scheduledTimeout =
-        Some(system.scheduler.scheduleOnce(timeout, self, Server.IdleTimeout))
+  private def completeRemovalOf(listenerActor: ActorRef) = {
+    val listener = listeners.get(listenerActor)
+    for (listener <- listener) {
+      if (!listener.bound.isCompleted)
+        listener.failBind()
+      if (!listener.unbound.isCompleted)
+        listener.failUnbind()
     }
+    listeners -= listenerActor
   }
+}
 
-  def callOnStopped() =
-    onStoppedCallback.foreach { callback =>
-      onStoppedCallback = None
-      Future(callback())(system.dispatcher)
-    }
+object ServerActor {
+  case object UnexpectedFailure extends RuntimeException
 
+  class ListenerBridge(listenerActor: ActorRef) extends Listener {
+    private val _bound = Promise[Listener.Bound]
+    private val _unbound = Promise[Listener.Unbound]
+
+    def completeBind() = _bound.complete(Success())
+    def completeUnbind() = _unbound.complete(Success())
+    def failBind() = _bound.complete(Failure(UnexpectedFailure))
+    def failUnbind() = _unbound.complete(Failure(UnexpectedFailure))
+
+    val bound = _bound.future
+    val unbound = _unbound.future
+    def unbind =
+      if (!unbound.isCompleted) listenerActor ! Listener.Unbind
+  }
 }
